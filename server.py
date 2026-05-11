@@ -15,9 +15,11 @@ import requests as req
 import yfinance as yf
 import pandas as pd
 import hashlib
-import gzip
 
 import time
+
+# ── Demo ──────────────────────────────────────────────────────────
+_demo_df = None  # DataFrame completo cargado al arrancar
 
 # ── Parquet cache ─────────────────────────────────────────────────────
 # NOTA: Railway tiene filesystem efímero — el cache se pierde al reiniciar.
@@ -66,9 +68,6 @@ def leer_csv_y_cachear(file_bytes, file_hash):
 
 _cache = {}
 CACHE_TTL = 300  # 5 minutos en segundos
-
-# ── Demo pre-procesada ────────────────────────────────────────────
-_demo_data = None  # Se carga al arrancar si demo.csv.gz y DEMO_IDEMPRESA están disponibles
 
 
 def get_cached(key):
@@ -748,81 +747,76 @@ def mercado_historico():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
-# ── Demo data ─────────────────────────────────────────────────────
 
-def _cargar_demo():
-    """Carga y pre-procesa el CSV de demo al arrancar el servidor."""
-    global _demo_data
-    demo_path = os.path.join(os.path.dirname(__file__), 'data', 'demo.csv.gz')
+# ── Demo endpoints ────────────────────────────────────────────────
 
+def _cargar_demo_df():
+    """Carga el parquet de demo al arrancar. Sin filtrar — carga todo."""
+    global _demo_df
+    demo_path = os.path.join(os.path.dirname(__file__), 'data', 'produccion_pozos.parquet')
     if not os.path.exists(demo_path):
-        app.logger.warning(
-            "demo.csv.gz no encontrado — /datos-demo no disponible")
+        app.logger.warning("produccion_pozos.parquet no encontrado — /datos-demo no disponible")
         return
-
-    idempresa_demo = os.environ.get('DEMO_IDEMPRESA', '').strip()
-    if not idempresa_demo:
-        app.logger.warning(
-            "DEMO_IDEMPRESA no configurado — /datos-demo no disponible")
-        return
-
     try:
-        with gzip.open(demo_path, 'rb') as f:
-            file_bytes = f.read()
-
-        df = pd.read_csv(
-            io.BytesIO(file_bytes),
-            dtype=str,
-            low_memory=False,
-            encoding='utf-8-sig'
-        )
-        df = optimizar_df(df)
-
-        for col in df.select_dtypes(include='category').columns:
-            df[col] = df[col].astype(str)
-
-        df['idempresa'] = df['idempresa'].str.strip().replace('nan', '')
-        df_empresa = df[df['idempresa'] == idempresa_demo]
-
-        if df_empresa.empty:
-            app.logger.warning(
-                f"DEMO_IDEMPRESA={idempresa_demo!r} no encontrado en el CSV")
-            return
-
-        empresa_nombre = (
-            df_empresa['empresa'].iloc[0]
-            if 'empresa' in df_empresa.columns
-            else idempresa_demo
-        )
-        historico, catalogo = procesar_df(df_empresa)
-
-        _demo_data = {
-            'success': True,
-            'historico': historico,
-            'catalogo': catalogo,
-            'empresa': empresa_nombre,
-            'total': len(historico),
-            'pozos': len(catalogo),
-        }
-        app.logger.info(
-            f"Demo lista: {empresa_nombre} — {len(historico)} registros, {len(catalogo)} pozos"
-        )
-
+        _demo_df = pd.read_parquet(demo_path)
+        for col in _demo_df.select_dtypes(include='category').columns:
+            _demo_df[col] = _demo_df[col].astype(str)
+        _demo_df['idempresa'] = _demo_df['idempresa'].astype(str).str.strip().replace('nan', '')
+        _demo_df['empresa']   = _demo_df['empresa'].astype(str).str.strip().replace('nan', '')
+        app.logger.info(f"Demo cargada: {len(_demo_df)} filas, {_demo_df['idempresa'].nunique()} empresas")
     except Exception as e:
-        app.logger.error(f"Error cargando demo: {e}")
+        app.logger.error(f"Error cargando parquet demo: {e}")
 
 
-@app.route('/datos-demo', methods=['GET'])
-def datos_demo():
-    """Devuelve los datos pre-procesados de la empresa demo."""
-    if _demo_data is None:
+@app.route('/datos-demo/empresas', methods=['GET'])
+def demo_empresas():
+    """Lista de empresas disponibles en el parquet demo."""
+    if _demo_df is None:
         return jsonify({'success': False, 'error': 'Demo no disponible'}), 503
-    return jsonify(_demo_data)
+    try:
+        empresas = (
+            _demo_df[_demo_df['idempresa'] != '']
+            .drop_duplicates(subset='idempresa')
+            .sort_values('empresa')[['idempresa', 'empresa']]
+            .to_dict(orient='records')
+        )
+        return jsonify({'success': True, 'empresas': empresas})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
-# Cargar demo al arrancar (después de que procesar_df y optimizar_df estén definidos)
+@app.route('/datos-demo/filtrar', methods=['GET'])
+def demo_filtrar():
+    """Filtra el parquet demo por idempresa y devuelve historico + catalogo."""
+    if _demo_df is None:
+        return jsonify({'success': False, 'error': 'Demo no disponible'}), 503
+    idempresa = request.args.get('idempresa', '').strip()
+    if not idempresa:
+        return jsonify({'success': False, 'error': 'idempresa requerido'}), 400
+    try:
+        df_empresa = _demo_df[_demo_df['idempresa'] == idempresa].copy()
+        if df_empresa.empty:
+            return jsonify({'success': False, 'error': f'No se encontraron datos para idempresa={idempresa}'}), 404
+        df_empresa = optimizar_df(df_empresa)
+        for col in df_empresa.select_dtypes(include='category').columns:
+            df_empresa[col] = df_empresa[col].astype(str)
+        empresa_nombre = df_empresa['empresa'].iloc[0] if 'empresa' in df_empresa.columns else idempresa
+        historico, catalogo = procesar_df(df_empresa)
+        return jsonify({
+            'success':   True,
+            'historico': historico,
+            'catalogo':  catalogo,
+            'empresa':   empresa_nombre,
+            'total':     len(historico),
+            'pozos':     len(catalogo),
+        })
+    except Exception as e:
+        app.logger.error(f"Error filtrando demo: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 with app.app_context():
-    _cargar_demo()
+    _cargar_demo_df()
 
 
 if __name__ == '__main__':
