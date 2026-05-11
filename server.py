@@ -19,7 +19,9 @@ import hashlib
 import time
 
 # ── Demo ──────────────────────────────────────────────────────────
-_demo_df = None  # DataFrame completo cargado al arrancar
+DEMO_PARQUET = os.path.join(os.path.dirname(
+    __file__), 'data', 'produccion_pozos.parquet')
+_demo_empresas_cache = None  # Solo la lista de empresas, liviana
 
 # ── Parquet cache ─────────────────────────────────────────────────────
 # NOTA: Railway tiene filesystem efímero — el cache se pierde al reiniciar.
@@ -747,61 +749,54 @@ def mercado_historico():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
-
 # ── Demo endpoints ────────────────────────────────────────────────
-
-def _cargar_demo_df():
-    """Carga el parquet de demo al arrancar. Sin filtrar — carga todo."""
-    global _demo_df
-    demo_path = os.path.join(os.path.dirname(__file__), 'data', 'produccion_pozos.parquet')
-    if not os.path.exists(demo_path):
-        app.logger.warning("produccion_pozos.parquet no encontrado — /datos-demo no disponible")
-        return
-    try:
-        _demo_df = pd.read_parquet(demo_path)
-        for col in _demo_df.select_dtypes(include='category').columns:
-            _demo_df[col] = _demo_df[col].astype(str)
-        _demo_df['idempresa'] = _demo_df['idempresa'].astype(str).str.strip().replace('nan', '')
-        _demo_df['empresa']   = _demo_df['empresa'].astype(str).str.strip().replace('nan', '')
-        app.logger.info(f"Demo cargada: {len(_demo_df)} filas, {_demo_df['idempresa'].nunique()} empresas")
-    except Exception as e:
-        app.logger.error(f"Error cargando parquet demo: {e}")
-
 
 @app.route('/datos-demo/empresas', methods=['GET'])
 def demo_empresas():
-    """Lista de empresas disponibles en el parquet demo."""
-    if _demo_df is None:
+    """Lista de empresas disponibles en el parquet demo. Lee solo 2 columnas."""
+    global _demo_empresas_cache
+    if not os.path.exists(DEMO_PARQUET):
         return jsonify({'success': False, 'error': 'Demo no disponible'}), 503
     try:
-        empresas = (
-            _demo_df[_demo_df['idempresa'] != '']
-            .drop_duplicates(subset='idempresa')
-            .sort_values('empresa')[['idempresa', 'empresa']]
-            .to_dict(orient='records')
-        )
-        return jsonify({'success': True, 'empresas': empresas})
+        if _demo_empresas_cache is None:
+            df = pd.read_parquet(DEMO_PARQUET, columns=[
+                                 'idempresa', 'empresa'])
+            df['idempresa'] = df['idempresa'].astype(
+                str).str.strip().replace('nan', '')
+            df['empresa'] = df['empresa'].astype(
+                str).str.strip().replace('nan', '')
+            _demo_empresas_cache = (
+                df[df['idempresa'] != '']
+                .drop_duplicates(subset='idempresa')
+                .sort_values('empresa')[['idempresa', 'empresa']]
+                .to_dict(orient='records')
+            )
+            app.logger.info(
+                f"Demo empresas cacheadas: {len(_demo_empresas_cache)}")
+        return jsonify({'success': True, 'empresas': _demo_empresas_cache})
     except Exception as e:
+        app.logger.error(f"Error demo empresas: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/datos-demo/filtrar', methods=['GET'])
 def demo_filtrar():
-    """Filtra el parquet demo por idempresa y devuelve historico + catalogo."""
-    if _demo_df is None:
+    """Filtra el parquet demo por idempresa usando predicate pushdown (sin cargar todo en RAM)."""
+    if not os.path.exists(DEMO_PARQUET):
         return jsonify({'success': False, 'error': 'Demo no disponible'}), 503
     idempresa = request.args.get('idempresa', '').strip()
     if not idempresa:
         return jsonify({'success': False, 'error': 'idempresa requerido'}), 400
     try:
-        df_empresa = _demo_df[_demo_df['idempresa'] == idempresa].copy()
-        if df_empresa.empty:
+        df = pd.read_parquet(DEMO_PARQUET, filters=[
+                             ('idempresa', '==', idempresa)])
+        if df.empty:
             return jsonify({'success': False, 'error': f'No se encontraron datos para idempresa={idempresa}'}), 404
-        df_empresa = optimizar_df(df_empresa)
-        for col in df_empresa.select_dtypes(include='category').columns:
-            df_empresa[col] = df_empresa[col].astype(str)
-        empresa_nombre = df_empresa['empresa'].iloc[0] if 'empresa' in df_empresa.columns else idempresa
-        historico, catalogo = procesar_df(df_empresa)
+        df = optimizar_df(df)
+        for col in df.select_dtypes(include='category').columns:
+            df[col] = df[col].astype(str)
+        empresa_nombre = df['empresa'].iloc[0] if 'empresa' in df.columns else idempresa
+        historico, catalogo = procesar_df(df)
         return jsonify({
             'success':   True,
             'historico': historico,
@@ -813,10 +808,6 @@ def demo_filtrar():
     except Exception as e:
         app.logger.error(f"Error filtrando demo: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
-
-
-with app.app_context():
-    _cargar_demo_df()
 
 
 if __name__ == '__main__':
