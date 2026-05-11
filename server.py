@@ -781,17 +781,17 @@ def demo_empresas():
 
 @app.route('/datos-demo/filtrar', methods=['GET'])
 def demo_filtrar():
-    """Filtra el parquet demo por idempresa usando predicate pushdown (sin cargar todo en RAM)."""
-    if not os.path.exists(DEMO_PARQUET):
-        return jsonify({'success': False, 'error': 'Demo no disponible'}), 503
     idempresa = request.args.get('idempresa', '').strip()
     if not idempresa:
         return jsonify({'success': False, 'error': 'idempresa requerido'}), 400
+
+    parquet_path = os.path.join(os.path.dirname(
+        __file__), 'data', 'empresas', f'{idempresa}.parquet')
+    if not os.path.exists(parquet_path):
+        return jsonify({'success': False, 'error': f'No se encontraron datos para idempresa={idempresa}'}), 404
+
     try:
-        df = pd.read_parquet(DEMO_PARQUET, filters=[
-                             ('idempresa', '==', idempresa)])
-        if df.empty:
-            return jsonify({'success': False, 'error': f'No se encontraron datos para idempresa={idempresa}'}), 404
+        df = pd.read_parquet(parquet_path)
         df = optimizar_df(df)
         for col in df.select_dtypes(include='category').columns:
             df[col] = df[col].astype(str)
