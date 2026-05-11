@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: petrodash-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn server:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.11.4"
+      - key: DEMO_IDEMPRESA
+        sync: false  # Setear manualmente en el dashboard de Render
