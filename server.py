@@ -54,6 +54,27 @@ def get_parquet_path(file_hash):
     return os.path.join(PARQUET_CACHE_DIR, f"{file_hash}.parquet")
 
 
+# Columnas que realmente consume procesar_df (+ idempresa/empresa para filtrar
+# y nombrar). Leer solo estas baja mucho la memoria en datasets anchos.
+COLS_PROCESAR = [
+    'idpozo', 'sigla', 'anio', 'mes', 'areayacimiento', 'cuenca',
+    'tipoestado', 'prod_pet', 'prod_agua', 'prod_gas', 'tef',
+    'areapermisoconcesion', 'formacion', 'tipoextraccion', 'profundidad',
+    'empresa', 'provincia', 'tipo_de_recurso', 'idempresa',
+]
+
+
+def leer_parquet_necesario(path):
+    """Lee solo las columnas que usa procesar_df. Si algo falla, lee todo."""
+    try:
+        import pyarrow.parquet as pq
+        disponibles = set(pq.read_schema(path).names)
+        cols = [c for c in COLS_PROCESAR if c in disponibles]
+        return pd.read_parquet(path, columns=cols) if cols else pd.read_parquet(path)
+    except Exception:
+        return pd.read_parquet(path)
+
+
 def leer_csv_y_cachear(file_bytes, file_hash):
     """Lee el CSV desde bytes, optimiza y guarda Parquet. Devuelve DataFrame."""
     df = pd.read_csv(
@@ -380,10 +401,11 @@ def normalizar_estado(tipoestado):
 
 def procesar_df(df):
     """
-    Versión vectorizada de procesar_df.
-    ~50x más rápida que iterrows() para DataFrames grandes.
+    Versión vectorizada. Devuelve (df_hist, df_cat) como DataFrames; la
+    serialización a JSON la hace el caller con to_json (bajo pico de memoria).
+    No copia el df: col_str/col_num solo leen columnas, no mutan.
     """
-    d = df.copy()
+    d = df
 
     # ── Columnas de texto: fillna + strip ────────────────────────────
     def col_str(nombre):
@@ -433,7 +455,7 @@ def procesar_df(df):
         'corte_agua': corte,
         'tef':        tef.round(1),
     })
-    historico = df_hist.to_dict(orient='records')
+    historico = df_hist
 
     # ── Catálogo (un registro por pozo único) ─────────────────────────
     df_cat = pd.DataFrame({
@@ -449,10 +471,29 @@ def procesar_df(df):
         'provincia':       col_str('provincia'),
         'tipo_recurso':    col_str('tipo_de_recurso'),
     })
-    df_cat = df_cat.drop_duplicates(subset=['idpozo'])
-    catalogo = df_cat.drop(columns=['idpozo']).to_dict(orient='records')
+    catalogo = df_cat.drop_duplicates(subset=['idpozo']).drop(columns=['idpozo'])
 
     return historico, catalogo
+
+
+def construir_respuesta_empresa(df_hist, df_cat, empresa_nombre):
+    """
+    Serializa la respuesta con DataFrame.to_json (implementado en C, streaming),
+    en vez de to_dict(orient='records') + jsonify. Eso evita materializar una
+    lista gigante de dicts de Python — el pico de memoria que tiraba el worker
+    en el free tier (512 MB) con empresas grandes como YPF (502/503).
+    """
+    historico_json = df_hist.to_json(orient='records', force_ascii=False)
+    catalogo_json = df_cat.to_json(orient='records', force_ascii=False)
+    payload = (
+        '{"success":true,'
+        f'"historico":{historico_json},'
+        f'"catalogo":{catalogo_json},'
+        f'"empresa":{json.dumps(empresa_nombre, ensure_ascii=False)},'
+        f'"total":{len(df_hist)},'
+        f'"pozos":{len(df_cat)}}}'
+    )
+    return app.response_class(response=payload, status=200, mimetype='application/json')
 
 
 @app.route('/api/procesar-csv', methods=['POST'])
@@ -526,9 +567,9 @@ def filtrar():
         parquet_path = get_parquet_path(file_hash) if file_hash else None
 
         if parquet_path and os.path.exists(parquet_path):
-            # Cache hit — leer Parquet directo
+            # Cache hit — leer Parquet directo (solo columnas necesarias)
             app.logger.info(f"filtrar: cache hit {parquet_path}")
-            df = pd.read_parquet(parquet_path)
+            df = leer_parquet_necesario(parquet_path)
         else:
             # Cache miss — necesita el archivo
             if 'file' not in request.files:
@@ -540,14 +581,11 @@ def filtrar():
             computed_path = get_parquet_path(computed_hash)
 
             if os.path.exists(computed_path):
-                df = pd.read_parquet(computed_path)
+                df = leer_parquet_necesario(computed_path)
             else:
                 df = leer_csv_y_cachear(file_bytes, computed_hash)
 
-        for col in df.select_dtypes(include='category').columns:
-            df[col] = df[col].astype(str)
-
-        df['idempresa'] = df['idempresa'].str.strip().replace('nan', '')
+        df['idempresa'] = df['idempresa'].astype(str).str.strip().replace('nan', '')
         df_empresa = df[df['idempresa'] == idempresa]
 
         if df_empresa.empty:
@@ -556,16 +594,9 @@ def filtrar():
                 'error': f'No se encontraron datos para idempresa={idempresa}'
             }), 404
 
-        historico, catalogo = procesar_df(df_empresa)
-
-        return jsonify({
-            'success':   True,
-            'historico': historico,
-            'catalogo':  catalogo,
-            'empresa':   idempresa,
-            'total':     len(historico),
-            'pozos':     len(catalogo),
-        })
+        df_hist, df_cat = procesar_df(df_empresa)
+        del df, df_empresa
+        return construir_respuesta_empresa(df_hist, df_cat, idempresa)
 
     except Exception as e:
         app.logger.error(f"Error filtrando CSV: {str(e)}")
@@ -791,20 +822,15 @@ def demo_filtrar():
         return jsonify({'success': False, 'error': f'No se encontraron datos para idempresa={idempresa}'}), 404
 
     try:
-        df = pd.read_parquet(parquet_path)
+        df = leer_parquet_necesario(parquet_path)
         df = optimizar_df(df)
-        for col in df.select_dtypes(include='category').columns:
-            df[col] = df[col].astype(str)
-        empresa_nombre = df['empresa'].iloc[0] if 'empresa' in df.columns else idempresa
-        historico, catalogo = procesar_df(df)
-        return jsonify({
-            'success':   True,
-            'historico': historico,
-            'catalogo':  catalogo,
-            'empresa':   empresa_nombre,
-            'total':     len(historico),
-            'pozos':     len(catalogo),
-        })
+        empresa_nombre = (
+            str(df['empresa'].iloc[0])
+            if 'empresa' in df.columns and len(df) else idempresa
+        )
+        df_hist, df_cat = procesar_df(df)
+        del df  # liberar el input antes de serializar (baja el pico de memoria)
+        return construir_respuesta_empresa(df_hist, df_cat, empresa_nombre)
     except Exception as e:
         app.logger.error(f"Error filtrando demo: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
